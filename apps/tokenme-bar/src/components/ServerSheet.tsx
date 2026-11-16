@@ -525,8 +525,11 @@ export function ServerSheet({
     }));
     setReauth((cur) => {
       if (!cur) return cur;
-      // Changed host key: show the trust screen *before* any credential was sent.
-      if (!out.ok && out.mismatch && out.fingerprint) {
+      // Changed host key *before* any credential was sent (no error yet).
+      // A rejected password after the user already acked still reports
+      // mismatch — the pin differs — plus `error`. That is not a new trust
+      // prompt; it must fall through so the credential form can show it.
+      if (!out.ok && out.mismatch && out.fingerprint && !out.error) {
         return {
           ...cur,
           busy: false,

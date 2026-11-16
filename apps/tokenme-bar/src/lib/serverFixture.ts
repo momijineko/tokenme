@@ -274,7 +274,9 @@ export const serverMock = {
         ...fail("auth", "the server rejected the username or password"),
         fingerprint: presented,
         known_fingerprint: rec.fingerprint,
-        mismatch: false,
+        // Keep the mismatch bit, matching `reauth_probe`: a rejected password
+        // after the user already trusted a new key is still a mismatch.
+        mismatch,
       };
     }
     const session = nextId++;
