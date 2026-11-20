@@ -2010,6 +2010,8 @@ fn start_click_away_monitor(app: &AppHandle) {
                             // calendar covering the panel is an outside click
                             // even when the cursor still sits inside our frame,
                             // so dismiss instead of letting QuotaStrip react.
+                            // Popups this window owns (`<select>`) and IME
+                            // candidate windows still count as ours.
                             // Tauri's visibility cache can lag for a
                             // non-activating window immediately after a native
                             // show. Use the HWND state here so a desktop click
@@ -2058,31 +2060,40 @@ fn start_click_away_monitor(app: &AppHandle) {
         .ok();
 }
 
-/// Top-level HWND under the cursor after walking to the root owner.
+/// Top-level HWND under the cursor after walking parent and owner links.
 ///
-/// Shared with bubble / pet-notice hit tests so a covering Shell flyout is never
-/// mistaken for one of TokenMe's surfaces.
+/// `GA_ROOTOWNER` follows owners as well as parents. A WebView2 `<select>`
+/// list is a `WS_POPUP` with an owner and no parent, so `GA_ROOT` stops on
+/// the popup and choosing an option looks like an outside click. Shared with
+/// bubble / pet-notice hit tests so a covering Shell flyout — which TokenMe
+/// does not own — is never mistaken for one of our surfaces.
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_top_level_hwnd_at(x: i32, y: i32) -> Option<isize> {
     use windows_sys::Win32::Foundation::POINT;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, WindowFromPoint, GA_ROOT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, WindowFromPoint, GA_ROOTOWNER};
 
     let point = POINT { x, y };
     let hwnd = unsafe { WindowFromPoint(point) };
     if hwnd.is_null() {
         return None;
     }
-    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let root = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
     let top = if root.is_null() { hwnd } else { root };
     Some(top as isize)
 }
 
-/// True when the cursor's real top-level window is the panel, bubble, or pet notice.
+/// True when the cursor is on the panel, bubble, pet notice, a popup they
+/// own, or an IME candidate window.
 #[cfg(target_os = "windows")]
 fn windows_tokenme_owns_point(app: &AppHandle, panel: &WebviewWindow, x: i32, y: i32) -> bool {
     let Some(top) = windows_top_level_hwnd_at(x, y) else {
         return false;
     };
+    windows_hwnd_is_tokenme(app, panel, top) || windows_hwnd_is_ime_candidate(top)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_hwnd_is_tokenme(app: &AppHandle, panel: &WebviewWindow, top: isize) -> bool {
     if panel.hwnd().ok().is_some_and(|hwnd| hwnd.0 as isize == top) {
         return true;
     }
@@ -2097,6 +2108,74 @@ fn windows_tokenme_owns_point(app: &AppHandle, panel: &WebviewWindow, x: i32, y:
         }
     }
     false
+}
+
+/// IME candidate UI is a separate top-level window, so the owner walk does
+/// not land on the panel. Classic IMM/TSF classes cover the in-process
+/// windows; Windows 10+ Microsoft Pinyin draws the list in TextInputHost.
+/// Shell calendar flyouts share `Windows.UI.Core.CoreWindow` but are not
+/// that process, and must stay outside clicks.
+#[cfg(target_os = "windows")]
+fn windows_hwnd_is_ime_candidate(top: isize) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HWND};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
+
+    let hwnd = top as HWND;
+    if hwnd.is_null() {
+        return false;
+    }
+    let mut class = [0u16; 64];
+    let class_len =
+        unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) }.max(0) as usize;
+    let class_len = class_len.min(class.len());
+    let class_name = String::from_utf16_lossy(&class[..class_len]);
+    if windows_ime_candidate(&class_name, None) {
+        return true;
+    }
+
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    if pid == 0 {
+        return false;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return false;
+    }
+    let mut path = [0u16; 1024];
+    let mut path_len = path.len() as u32;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, path.as_mut_ptr(), &mut path_len)
+    } != 0;
+    unsafe {
+        CloseHandle(process);
+    }
+    if !ok {
+        return false;
+    }
+    let path_len = (path_len as usize).min(path.len());
+    let image = String::from_utf16_lossy(&path[..path_len]);
+    windows_ime_candidate(&class_name, Some(&image))
+}
+
+/// Pure stand-in for the Win32 class / image test so the Shell-calendar
+/// distinction can be checked off Windows.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_ime_candidate(class_name: &str, image_path: Option<&str>) -> bool {
+    if matches!(class_name, "IME" | "MSCTFIME UI" | "CiceroUIWndFrame") {
+        return true;
+    }
+    image_path.is_some_and(|path| {
+        path.rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|file| file.eq_ignore_ascii_case("TextInputHost.exe"))
+    })
 }
 
 /// Axis-aligned overlap used when deciding whether a foreign topmost flyout
@@ -2299,6 +2378,36 @@ mod tests {
             !rects_overlap((100, 100, 500, 760), (100, 800, 500, 900)),
             "a flyout fully below the panel is not covering it"
         );
+    }
+
+    #[test]
+    fn ime_candidate_is_not_an_outside_click_and_shell_calendar_still_is() {
+        assert!(windows_ime_candidate("IME", None));
+        assert!(windows_ime_candidate("MSCTFIME UI", None));
+        assert!(windows_ime_candidate("CiceroUIWndFrame", None));
+        assert!(windows_ime_candidate(
+            "Windows.UI.Core.CoreWindow",
+            Some(r"C:\Windows\SystemApps\TextInputHost.exe"),
+        ));
+        assert!(windows_ime_candidate(
+            "",
+            Some(r"C:\Windows\System32\textinputhost.EXE"),
+        ));
+        // The calendar flyout uses the same CoreWindow class. It must stay an
+        // outside click so QuotaStrip does not eat the Shell UI.
+        assert!(!windows_ime_candidate(
+            "Windows.UI.Core.CoreWindow",
+            Some(r"C:\Windows\SystemApps\ShellExperienceHost.exe"),
+        ));
+        assert!(!windows_ime_candidate("Windows.UI.Core.CoreWindow", None));
+        assert!(!windows_ime_candidate(
+            "Chrome_WidgetWin_1",
+            Some(r"C:\Apps\NotTextInputHost.exe"),
+        ));
+        assert!(!windows_ime_candidate(
+            "ApplicationFrameWindow",
+            Some(r"C:\Windows\TextInputHost.exe\other.exe"),
+        ));
     }
 
     #[test]
